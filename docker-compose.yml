@@ -1,0 +1,34 @@
+services:
+  turn-proxy:
+    image: ghcr.io/demochasr/turn_proxy:latest
+    restart: unless-stopped
+    ports:
+      - "56000:56000/udp"
+    environment:
+      CONNECT_ADDR: ${CONNECT_ADDR:?CONNECT_ADDR is required}
+      PROXY_ID: ${PROXY_ID:?PROXY_ID is required}
+      TURN_BOOTSTRAP_PUBLIC_KEY: ${TURN_BOOTSTRAP_PUBLIC_KEY:?TURN_BOOTSTRAP_PUBLIC_KEY is required}
+      TURN_BOOTSTRAP_SECRET: ${TURN_BOOTSTRAP_SECRET:-}
+      TCP_MODE: ${TCP_MODE:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
+    command:
+      - --interval
+      - "300"
+      - --cleanup
+      - --label-enable
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
