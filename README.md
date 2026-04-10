@@ -254,6 +254,35 @@ docker run -p 56000:56000/udp -e CONNECT_ADDR=127.0.0.1:443 -e TCP_MODE=true vk-
 ./client -peer <ip сервера>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 -tcp
 ```
 
+### Множественные TURN-сессии
+
+В режиме `-tcp` флаг `-n` задаёт число параллельных `TURN -> DTLS -> KCP -> smux`
+сессий. Новые локальные TCP-подключения распределяются между ними по round-robin.
+
+Пример:
+
+```
+./client -peer <ip сервера>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 -tcp -n 4
+```
+
+Важно:
+
+- `-n` помогает только если нагрузка использует несколько параллельных TCP-соединений
+- один TCP-поток не делится на несколько TURN-сессий
+- `-tcp` не меняет transport до peer: серверный `turn_proxy` всё равно слушает UDP `:56000`
+- при отладке через статический TURN server обычно нужен `-udp`, если сам TURN server доступен только по UDP
+
+Для отладки и тестов можно обойтись без `-vk-link`/`-yandex-link` и передать
+готовые TURN-учётные данные напрямую:
+
+```
+./client -peer <ip сервера>:56000 -listen 127.0.0.1:9000 -tcp -udp \
+  -turn-user <username> -turn-pass <password> -turn-addr <host:port>
+```
+
+Все три флага `-turn-user`, `-turn-pass` и `-turn-addr` обязательны вместе.
+Флаг `-udp` нужен, если ваш TURN-сервер принимает только UDP на `3478`.
+
 <details>
 
 <summary>

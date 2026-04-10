@@ -597,21 +597,36 @@ type turnParams struct {
 	link           string
 	udp            bool
 	bootstrapToken string
+	turnUser       string
+	turnPass       string
+	turnAddr       string
 	getCreds       getCredsFunc
 }
 
-func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
-	var err error = nil
-	defer func() { c <- err }()
-	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
-	if err1 != nil {
-		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
-		return
+func resolveTurnCredentials(turnParams *turnParams) (string, string, string, error) {
+	if turnParams.turnUser != "" || turnParams.turnPass != "" || turnParams.turnAddr != "" {
+		if turnParams.turnUser == "" || turnParams.turnPass == "" || turnParams.turnAddr == "" {
+			return "", "", "", fmt.Errorf("static TURN override requires turn-user, turn-pass, and turn-addr")
+		}
+		return turnParams.turnUser, turnParams.turnPass, turnParams.turnAddr, nil
 	}
-	urlhost, urlport, err1 := net.SplitHostPort(url)
-	if err1 != nil {
-		err = fmt.Errorf("failed to parse TURN server address: %s", err1)
-		return
+
+	user, pass, url, err := turnParams.getCreds(turnParams.link)
+	if err != nil {
+		return "", "", "", err
+	}
+	return user, pass, url, nil
+}
+
+func resolveTurnServerAddr(turnParams *turnParams) (string, string, string, *net.UDPAddr, error) {
+	user, pass, url, err := resolveTurnCredentials(turnParams)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+
+	urlhost, urlport, err := net.SplitHostPort(url)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("failed to parse TURN server address: %w", err)
 	}
 	if turnParams.host != "" {
 		urlhost = turnParams.host
@@ -619,15 +634,23 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	if turnParams.port != "" {
 		urlport = turnParams.port
 	}
-	var turnServerAddr string
-	turnServerAddr = net.JoinHostPort(urlhost, urlport)
-	turnServerUdpAddr, err1 := net.ResolveUDPAddr("udp", turnServerAddr)
+	turnServerAddr := net.JoinHostPort(urlhost, urlport)
+	turnServerUDPAddr, err := net.ResolveUDPAddr("udp", turnServerAddr)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("failed to resolve TURN server address: %w", err)
+	}
+	return user, pass, turnServerUDPAddr.String(), turnServerUDPAddr, nil
+}
+
+func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
+	var err error = nil
+	defer func() { c <- err }()
+	user, pass, turnServerAddr, turnServerUDPAddr, err1 := resolveTurnServerAddr(turnParams)
 	if err1 != nil {
-		err = fmt.Errorf("failed to resolve TURN server address: %s", err1)
+		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
 		return
 	}
-	turnServerAddr = turnServerUdpAddr.String()
-	fmt.Println(turnServerUdpAddr.IP)
+	fmt.Println(turnServerUDPAddr.IP)
 	// Dial TURN Server
 	var cfg *turn.ClientConfig
 	var turnConn net.PacketConn
@@ -635,7 +658,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	ctx1, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if turnParams.udp {
-		conn, err2 := net.DialUDP("udp", nil, turnServerUdpAddr) // nolint: noctx
+		conn, err2 := net.DialUDP("udp", nil, turnServerUDPAddr) // nolint: noctx
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
@@ -851,6 +874,9 @@ func main() { //nolint:cyclop
 	tcpMode := flag.Bool("tcp", false, "TCP mode: forward TCP connections (for VLESS) instead of UDP packets")
 	sessionIDFlag := flag.String("session-id", "", "override session ID (hex, 32 chars)")
 	bootstrapToken := flag.String("bootstrap-token", "", "short-lived TURN bootstrap token from API")
+	turnUser := flag.String("turn-user", "", "static TURN username override")
+	turnPass := flag.String("turn-pass", "", "static TURN password override")
+	turnAddr := flag.String("turn-addr", "", "static TURN server address override (host:port)")
 	flag.Parse()
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -859,13 +885,24 @@ func main() { //nolint:cyclop
 	if err != nil {
 		panic(err)
 	}
-	if (*vklink == "") == (*yalink == "") {
+	staticTurn := *turnUser != "" || *turnPass != "" || *turnAddr != ""
+	if staticTurn && (*turnUser == "" || *turnPass == "" || *turnAddr == "") {
+		log.Panicf("Need turn-user, turn-pass and turn-addr together")
+	}
+	if !staticTurn && (*vklink == "") == (*yalink == "") {
 		log.Panicf("Need either vk-link or yandex-link!")
 	}
 
 	var link string
 	var getCreds getCredsFunc
-	if *vklink != "" {
+	if staticTurn {
+		if *n <= 0 {
+			*n = 1
+		}
+		getCreds = func(string) (string, string, string, error) {
+			return *turnUser, *turnPass, *turnAddr, nil
+		}
+	} else if *vklink != "" {
 		parts := strings.Split(*vklink, "join/")
 		link = parts[len(parts)-1]
 
@@ -898,11 +935,14 @@ func main() { //nolint:cyclop
 		link:           link,
 		udp:            *udp,
 		bootstrapToken: *bootstrapToken,
+		turnUser:       *turnUser,
+		turnPass:       *turnPass,
+		turnAddr:       *turnAddr,
 		getCreds:       getCreds,
 	}
 
 	if *tcpMode {
-		runTCPMode(ctx, params, peer, *listen)
+		runVLESSMode(ctx, params, peer, *listen, *n)
 		return
 	}
 
@@ -976,10 +1016,127 @@ func main() { //nolint:cyclop
 	wg1.Wait()
 }
 
-// runTCPMode implements TCP forwarding mode for VLESS.
-// It establishes a DTLS tunnel through TURN, then creates a KCP+smux session
-// on top, and forwards incoming TCP connections as smux streams.
-func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string) {
+type sessionPool struct {
+	mu       sync.RWMutex
+	sessions []*smux.Session
+	counter  atomic.Uint64
+}
+
+func (p *sessionPool) add(s *smux.Session) {
+	p.mu.Lock()
+	p.sessions = append(p.sessions, s)
+	p.mu.Unlock()
+}
+
+func (p *sessionPool) remove(s *smux.Session) {
+	p.mu.Lock()
+	for i, sess := range p.sessions {
+		if sess == s {
+			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
+			break
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *sessionPool) pick() *smux.Session {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := len(p.sessions)
+	if n == 0 {
+		return nil
+	}
+	idx := p.counter.Add(1) % uint64(n)
+	return p.sessions[idx]
+}
+
+func (p *sessionPool) count() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.sessions)
+}
+
+// runVLESSMode implements TCP forwarding with round-robin balancing across N TURN sessions.
+func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
+	if numSessions <= 0 {
+		numSessions = 1
+	}
+	pool := &sessionPool{}
+
+	var wgMaint sync.WaitGroup
+	for i := 0; i < numSessions; i++ {
+		wgMaint.Add(1)
+		go func(id int) {
+			defer wgMaint.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
+			}
+			maintainVLESSSession(ctx, tp, peer, id, pool)
+		}(i)
+	}
+
+	log.Printf("TCP mode: waiting for sessions to connect (target: %d)", numSessions)
+	for {
+		select {
+		case <-ctx.Done():
+			wgMaint.Wait()
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+		if pool.count() > 0 {
+			break
+		}
+	}
+
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Panicf("TCP listen: %s", err)
+	}
+	context.AfterFunc(ctx, func() { _ = listener.Close() })
+	log.Printf("TCP mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
+
+	var wgConn sync.WaitGroup
+	for {
+		tcpConn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				wgConn.Wait()
+				wgMaint.Wait()
+				return
+			default:
+			}
+			log.Printf("TCP accept error: %s", err)
+			continue
+		}
+
+		sess := pool.pick()
+		if sess == nil || sess.IsClosed() {
+			log.Printf("No active sessions, rejecting local TCP connection")
+			_ = tcpConn.Close()
+			continue
+		}
+
+		wgConn.Add(1)
+		go func(tc net.Conn, s *smux.Session) {
+			defer wgConn.Done()
+			defer func() { _ = tc.Close() }()
+
+			stream, err := s.OpenStream()
+			if err != nil {
+				log.Printf("smux open stream error: %s", err)
+				return
+			}
+			defer func() { _ = stream.Close() }()
+
+			pipe(ctx, tc, stream)
+		}(tcpConn, sess)
+	}
+}
+
+func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -987,10 +1144,33 @@ func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAd
 		default:
 		}
 
-		err := runTCPSession(ctx, tp, peer, listenAddr)
+		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer)
 		if err != nil {
-			log.Printf("TCP session error: %s, reconnecting...", err)
+			log.Printf("[session %d] setup error: %s, retrying...", id, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
 		}
+
+		pool.add(smuxSess)
+		log.Printf("[session %d] connected (active: %d)", id, pool.count())
+
+		for !smuxSess.IsClosed() {
+			select {
+			case <-ctx.Done():
+				pool.remove(smuxSess)
+				cleanup()
+				return
+			case <-time.After(1 * time.Second):
+			}
+		}
+
+		pool.remove(smuxSess)
+		cleanup()
+		log.Printf("[session %d] disconnected (active: %d), reconnecting...", id, pool.count())
 
 		select {
 		case <-ctx.Done():
@@ -1000,52 +1180,40 @@ func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAd
 	}
 }
 
-func runTCPSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string) error {
-	// 1. Get TURN credentials
-	user, pass, url, err := tp.getCreds(tp.link)
-	if err != nil {
-		return fmt.Errorf("get TURN creds: %w", err)
+func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr) (*smux.Session, func(), error) {
+	var cleanupFns []func()
+	cleanup := func() {
+		for i := len(cleanupFns) - 1; i >= 0; i-- {
+			cleanupFns[i]()
+		}
 	}
-	urlhost, urlport, err := net.SplitHostPort(url)
-	if err != nil {
-		return fmt.Errorf("parse TURN addr: %w", err)
-	}
-	if tp.host != "" {
-		urlhost = tp.host
-	}
-	if tp.port != "" {
-		urlport = tp.port
-	}
-	turnServerAddr := net.JoinHostPort(urlhost, urlport)
-	turnServerUdpAddr, err := net.ResolveUDPAddr("udp", turnServerAddr)
-	if err != nil {
-		return fmt.Errorf("resolve TURN addr: %w", err)
-	}
-	turnServerAddr = turnServerUdpAddr.String()
-	fmt.Println(turnServerUdpAddr.IP)
 
-	// 2. Connect to TURN server
+	user, pass, turnServerAddr, turnServerUDPAddr, err := resolveTurnServerAddr(tp)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get TURN creds: %w", err)
+	}
+	fmt.Println(turnServerUDPAddr.IP)
+
 	var turnConn net.PacketConn
 	ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel1()
 	if tp.udp {
-		conn, err := net.DialUDP("udp", nil, turnServerUdpAddr)
+		conn, err := net.DialUDP("udp", nil, turnServerUDPAddr)
 		if err != nil {
-			return fmt.Errorf("dial TURN (udp): %w", err)
+			return nil, nil, fmt.Errorf("dial TURN (udp): %w", err)
 		}
-		defer conn.Close()
+		cleanupFns = append(cleanupFns, func() { _ = conn.Close() })
 		turnConn = &connectedUDPConn{conn}
 	} else {
 		var d net.Dialer
 		conn, err := d.DialContext(ctx1, "tcp", turnServerAddr)
 		if err != nil {
-			return fmt.Errorf("dial TURN (tcp): %w", err)
+			return nil, nil, fmt.Errorf("dial TURN (tcp): %w", err)
 		}
-		defer conn.Close()
+		cleanupFns = append(cleanupFns, func() { _ = conn.Close() })
 		turnConn = turn.NewSTUNConn(conn)
 	}
 
-	// 3. Allocate TURN relay
 	var addrFamily turn.RequestedAddressFamily
 	if peer.IP.To4() != nil {
 		addrFamily = turn.RequestedAddressFamilyIPv4
@@ -1063,28 +1231,29 @@ func runTCPSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, liste
 	}
 	turnClient, err := turn.NewClient(cfg)
 	if err != nil {
-		return fmt.Errorf("create TURN client: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("create TURN client: %w", err)
 	}
-	defer turnClient.Close()
+	cleanupFns = append(cleanupFns, turnClient.Close)
 	if err = turnClient.Listen(); err != nil {
-		return fmt.Errorf("TURN listen: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("TURN listen: %w", err)
 	}
 	relayConn, err := turnClient.Allocate()
 	if err != nil {
-		return fmt.Errorf("TURN allocate: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("TURN allocate: %w", err)
 	}
-	defer relayConn.Close()
+	cleanupFns = append(cleanupFns, func() { _ = relayConn.Close() })
 	log.Printf("relayed-address=%s", relayConn.LocalAddr().String())
 
-	// 4. Establish DTLS over TURN relay
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
-		return fmt.Errorf("generate cert: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("generate cert: %w", err)
 	}
 
-	// Create a connected PacketConn for DTLS: relay writes go to peer
 	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer}
-
 	dtlsConfig := &dtls.Config{
 		Certificates:          []tls.Certificate{certificate},
 		InsecureSkipVerify:    true,
@@ -1095,80 +1264,42 @@ func runTCPSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, liste
 
 	dtlsConn, err := dtls.Client(dtlsPC, peer, dtlsConfig)
 	if err != nil {
-		return fmt.Errorf("DTLS client create: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("DTLS client create: %w", err)
 	}
-
 	ctx2, cancel2 := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel2()
 	if err = dtlsConn.HandshakeContext(ctx2); err != nil {
-		dtlsConn.Close()
-		return fmt.Errorf("DTLS handshake: %w", err)
+		_ = dtlsConn.Close()
+		cleanup()
+		return nil, nil, fmt.Errorf("DTLS handshake: %w", err)
 	}
-	defer dtlsConn.Close()
+	cleanupFns = append(cleanupFns, func() { _ = dtlsConn.Close() })
 	log.Printf("DTLS connection established")
 	if tp.bootstrapToken != "" {
 		if err = bootstrap.Write(dtlsConn, tp.bootstrapToken); err != nil {
-			return fmt.Errorf("write bootstrap token: %w", err)
+			cleanup()
+			return nil, nil, fmt.Errorf("write bootstrap token: %w", err)
 		}
 	}
 
-	// 5. Create KCP session over DTLS
 	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
 	if err != nil {
-		return fmt.Errorf("KCP session: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("KCP session: %w", err)
 	}
-	defer kcpSess.Close()
+	cleanupFns = append(cleanupFns, func() { _ = kcpSess.Close() })
 	log.Printf("KCP session established")
 
-	// 6. Create smux client session over KCP
 	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
 	if err != nil {
-		return fmt.Errorf("smux client: %w", err)
+		cleanup()
+		return nil, nil, fmt.Errorf("smux client: %w", err)
 	}
-	defer smuxSess.Close()
+	cleanupFns = append(cleanupFns, func() { _ = smuxSess.Close() })
 	log.Printf("smux session established")
 
-	// 7. Listen for TCP connections and forward through smux
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("TCP listen: %w", err)
-	}
-	context.AfterFunc(ctx, func() { listener.Close() })
-	log.Printf("TCP mode: listening on %s", listenAddr)
-
-	var wg sync.WaitGroup
-	for {
-		tcpConn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				wg.Wait()
-				return nil
-			default:
-			}
-			if smuxSess.IsClosed() {
-				wg.Wait()
-				return fmt.Errorf("smux session closed")
-			}
-			log.Printf("TCP accept error: %s", err)
-			continue
-		}
-
-		wg.Add(1)
-		go func(tc net.Conn) {
-			defer wg.Done()
-			defer tc.Close()
-
-			stream, err := smuxSess.OpenStream()
-			if err != nil {
-				log.Printf("smux open stream error: %s", err)
-				return
-			}
-			defer stream.Close()
-
-			pipe(ctx, tc, stream)
-		}(tcpConn)
-	}
+	return smuxSess, cleanup, nil
 }
 
 // relayPacketConn wraps a TURN relay PacketConn to direct all writes to the peer.
