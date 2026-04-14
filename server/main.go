@@ -39,9 +39,8 @@ type sessionDatagramConn struct {
 	deadlineMu    sync.RWMutex
 	readDeadline  time.Time
 	writeDeadline time.Time
-	addrMu        sync.RWMutex
-	lastLocalAddr net.Addr
-	lastPeerAddr  net.Addr
+	localAddr     net.Addr
+	remoteAddr    net.Addr
 }
 
 type UserSession struct {
@@ -55,15 +54,9 @@ type UserSession struct {
 	Ctx         context.Context
 	Cancel      context.CancelFunc
 	Manager     *SessionManager
-	RecvCh      chan receivedPacket
+	RecvCh      chan []byte
 	WriteSeq    atomic.Uint64
 	CleanupOnce sync.Once
-}
-
-type receivedPacket struct {
-	payload    []byte
-	localAddr  net.Addr
-	remoteAddr net.Addr
 }
 
 type SessionManager struct {
@@ -91,7 +84,7 @@ func (m *SessionManager) GetOrCreate(ctx context.Context, id, connectAddr, mode 
 		Ctx:         sessionCtx,
 		Cancel:      cancel,
 		Manager:     m,
-		RecvCh:      make(chan receivedPacket, 1024),
+		RecvCh:      make(chan []byte, 1024),
 	}
 
 	switch mode {
@@ -104,7 +97,11 @@ func (m *SessionManager) GetOrCreate(ctx context.Context, id, connectAddr, mode 
 		session.BackendConn = backendConn
 		go session.backendReaderLoop()
 	case modeTCPVLESS:
-		session.PacketConn = &sessionDatagramConn{session: session}
+		session.PacketConn = &sessionDatagramConn{
+			session:    session,
+			localAddr:  dummyAddr("session-local-" + id),
+			remoteAddr: dummyAddr("session-remote-" + id),
+		}
 		go session.tcpBackendLoop()
 	default:
 		cancel()
@@ -289,11 +286,7 @@ func (s *UserSession) connReadLoop(id byte, conn net.Conn, done chan struct{}) {
 			return
 		}
 
-		packet := receivedPacket{
-			payload:    append([]byte(nil), buf[:n]...),
-			localAddr:  conn.LocalAddr(),
-			remoteAddr: conn.RemoteAddr(),
-		}
+		packet := append([]byte(nil), buf[:n]...)
 		select {
 		case <-s.Ctx.Done():
 			return
@@ -329,8 +322,7 @@ func (c *sessionDatagramConn) Read(b []byte) (int, error) {
 		case <-deadline:
 			return 0, os.ErrDeadlineExceeded
 		case packet := <-c.session.RecvCh:
-			c.setLastReadAddrs(packet.localAddr, packet.remoteAddr)
-			n := copy(b, packet.payload)
+			n := copy(b, packet)
 			return n, nil
 		}
 	}
@@ -364,23 +356,11 @@ func (c *sessionDatagramConn) closeOnly() error {
 }
 
 func (c *sessionDatagramConn) LocalAddr() net.Addr {
-	if addr := c.getLastLocalAddr(); addr != nil {
-		return addr
-	}
-	if conn, err := c.session.pickConn(); err == nil {
-		return conn.LocalAddr()
-	}
-	return dummyAddr("session-local")
+	return c.localAddr
 }
 
 func (c *sessionDatagramConn) RemoteAddr() net.Addr {
-	if addr := c.getLastPeerAddr(); addr != nil {
-		return addr
-	}
-	if conn, err := c.session.pickConn(); err == nil {
-		return conn.RemoteAddr()
-	}
-	return dummyAddr("session-remote")
+	return c.remoteAddr
 }
 
 func (c *sessionDatagramConn) SetDeadline(t time.Time) error {
@@ -415,25 +395,6 @@ func (c *sessionDatagramConn) getWriteDeadline() time.Time {
 	c.deadlineMu.RLock()
 	defer c.deadlineMu.RUnlock()
 	return c.writeDeadline
-}
-
-func (c *sessionDatagramConn) setLastReadAddrs(localAddr, peerAddr net.Addr) {
-	c.addrMu.Lock()
-	c.lastLocalAddr = localAddr
-	c.lastPeerAddr = peerAddr
-	c.addrMu.Unlock()
-}
-
-func (c *sessionDatagramConn) getLastLocalAddr() net.Addr {
-	c.addrMu.RLock()
-	defer c.addrMu.RUnlock()
-	return c.lastLocalAddr
-}
-
-func (c *sessionDatagramConn) getLastPeerAddr() net.Addr {
-	c.addrMu.RLock()
-	defer c.addrMu.RUnlock()
-	return c.lastPeerAddr
 }
 
 type dummyAddr string

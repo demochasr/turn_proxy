@@ -1027,32 +1027,27 @@ type multipathDTLSConn struct {
 	cancel        context.CancelFunc
 	mu            sync.RWMutex
 	conns         []dtlsStreamEntry
-	recvCh        chan receivedPacket
+	recvCh        chan []byte
 	writeSeq      atomic.Uint64
 	readyCh       chan struct{}
 	readyOnce     sync.Once
 	deadlineMu    sync.RWMutex
 	readDeadline  time.Time
 	writeDeadline time.Time
-	addrMu        sync.RWMutex
-	lastLocalAddr net.Addr
-	lastPeerAddr  net.Addr
-}
-
-type receivedPacket struct {
-	payload    []byte
-	localAddr  net.Addr
-	remoteAddr net.Addr
+	localAddr     net.Addr
+	remoteAddr    net.Addr
 }
 
 func newMultipathDTLSConn(ctx context.Context) *multipathDTLSConn {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	return &multipathDTLSConn{
-		ctx:     sessionCtx,
-		cancel:  cancel,
-		conns:   make([]dtlsStreamEntry, 0),
-		recvCh:  make(chan receivedPacket, 1024),
-		readyCh: make(chan struct{}),
+		ctx:        sessionCtx,
+		cancel:     cancel,
+		conns:      make([]dtlsStreamEntry, 0),
+		recvCh:     make(chan []byte, 1024),
+		readyCh:    make(chan struct{}),
+		localAddr:  dummyAddr("multipath-local"),
+		remoteAddr: dummyAddr("multipath-remote"),
 	}
 }
 
@@ -1106,11 +1101,7 @@ func (m *multipathDTLSConn) connReadLoop(id byte, conn net.Conn, done chan struc
 			return
 		}
 
-		packet := receivedPacket{
-			payload:    append([]byte(nil), buf[:n]...),
-			localAddr:  conn.LocalAddr(),
-			remoteAddr: conn.RemoteAddr(),
-		}
+		packet := append([]byte(nil), buf[:n]...)
 		select {
 		case <-m.ctx.Done():
 			return
@@ -1165,8 +1156,7 @@ func (m *multipathDTLSConn) Read(b []byte) (int, error) {
 		case <-deadline:
 			return 0, os.ErrDeadlineExceeded
 		case packet := <-m.recvCh:
-			m.setLastReadAddrs(packet.localAddr, packet.remoteAddr)
-			n := copy(b, packet.payload)
+			n := copy(b, packet)
 			return n, nil
 		}
 	}
@@ -1198,23 +1188,11 @@ func (m *multipathDTLSConn) Close() error {
 }
 
 func (m *multipathDTLSConn) LocalAddr() net.Addr {
-	if addr := m.getLastLocalAddr(); addr != nil {
-		return addr
-	}
-	if conn, err := m.pickConn(); err == nil {
-		return conn.LocalAddr()
-	}
-	return dummyAddr("multipath-local")
+	return m.localAddr
 }
 
 func (m *multipathDTLSConn) RemoteAddr() net.Addr {
-	if addr := m.getLastPeerAddr(); addr != nil {
-		return addr
-	}
-	if conn, err := m.pickConn(); err == nil {
-		return conn.RemoteAddr()
-	}
-	return dummyAddr("multipath-remote")
+	return m.remoteAddr
 }
 
 func (m *multipathDTLSConn) SetDeadline(t time.Time) error {
@@ -1249,25 +1227,6 @@ func (m *multipathDTLSConn) getWriteDeadline() time.Time {
 	m.deadlineMu.RLock()
 	defer m.deadlineMu.RUnlock()
 	return m.writeDeadline
-}
-
-func (m *multipathDTLSConn) setLastReadAddrs(localAddr, peerAddr net.Addr) {
-	m.addrMu.Lock()
-	m.lastLocalAddr = localAddr
-	m.lastPeerAddr = peerAddr
-	m.addrMu.Unlock()
-}
-
-func (m *multipathDTLSConn) getLastLocalAddr() net.Addr {
-	m.addrMu.RLock()
-	defer m.addrMu.RUnlock()
-	return m.lastLocalAddr
-}
-
-func (m *multipathDTLSConn) getLastPeerAddr() net.Addr {
-	m.addrMu.RLock()
-	defer m.addrMu.RUnlock()
-	return m.lastPeerAddr
 }
 
 type smuxHolder struct {
