@@ -1016,78 +1016,322 @@ func main() { //nolint:cyclop
 	wg1.Wait()
 }
 
-type sessionPool struct {
-	mu       sync.RWMutex
-	sessions []*smux.Session
-	counter  atomic.Uint64
+type dtlsStreamEntry struct {
+	id   byte
+	conn net.Conn
+	done chan struct{}
 }
 
-func (p *sessionPool) add(s *smux.Session) {
-	p.mu.Lock()
-	p.sessions = append(p.sessions, s)
-	p.mu.Unlock()
+type multipathDTLSConn struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	mu            sync.RWMutex
+	conns         []dtlsStreamEntry
+	recvCh        chan receivedPacket
+	writeSeq      atomic.Uint64
+	readyCh       chan struct{}
+	readyOnce     sync.Once
+	deadlineMu    sync.RWMutex
+	readDeadline  time.Time
+	writeDeadline time.Time
+	addrMu        sync.RWMutex
+	lastLocalAddr net.Addr
+	lastPeerAddr  net.Addr
 }
 
-func (p *sessionPool) remove(s *smux.Session) {
-	p.mu.Lock()
-	for i, sess := range p.sessions {
-		if sess == s {
-			p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
-			break
+type receivedPacket struct {
+	payload    []byte
+	localAddr  net.Addr
+	remoteAddr net.Addr
+}
+
+func newMultipathDTLSConn(ctx context.Context) *multipathDTLSConn {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	return &multipathDTLSConn{
+		ctx:     sessionCtx,
+		cancel:  cancel,
+		conns:   make([]dtlsStreamEntry, 0),
+		recvCh:  make(chan receivedPacket, 1024),
+		readyCh: make(chan struct{}),
+	}
+}
+
+func (m *multipathDTLSConn) AddConn(id byte, conn net.Conn) <-chan struct{} {
+	done := make(chan struct{})
+
+	m.mu.Lock()
+	for i, entry := range m.conns {
+		if entry.id == id {
+			_ = entry.conn.Close()
+			m.conns[i] = dtlsStreamEntry{id: id, conn: conn, done: done}
+			m.mu.Unlock()
+			m.readyOnce.Do(func() { close(m.readyCh) })
+			go m.connReadLoop(id, conn, done)
+			return done
 		}
 	}
-	p.mu.Unlock()
+	m.conns = append(m.conns, dtlsStreamEntry{id: id, conn: conn, done: done})
+	m.mu.Unlock()
+
+	m.readyOnce.Do(func() { close(m.readyCh) })
+	go m.connReadLoop(id, conn, done)
+	return done
 }
 
-func (p *sessionPool) pick() *smux.Session {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	n := len(p.sessions)
-	if n == 0 {
-		return nil
+func (m *multipathDTLSConn) RemoveConn(id byte, conn net.Conn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, entry := range m.conns {
+		if entry.id == id && entry.conn == conn {
+			m.conns = append(m.conns[:i], m.conns[i+1:]...)
+			return
+		}
 	}
-	idx := p.counter.Add(1) % uint64(n)
-	return p.sessions[idx]
 }
 
-func (p *sessionPool) count() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.sessions)
+func (m *multipathDTLSConn) connReadLoop(id byte, conn net.Conn, done chan struct{}) {
+	defer close(done)
+	defer m.RemoveConn(id, conn)
+
+	buf := make([]byte, 2048)
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			log.Printf("[stream %d] read deadline error: %v", id, err)
+			return
+		}
+		n, err := conn.Read(buf)
+		if err != nil {
+			log.Printf("[stream %d] closed: %v", id, err)
+			return
+		}
+
+		packet := receivedPacket{
+			payload:    append([]byte(nil), buf[:n]...),
+			localAddr:  conn.LocalAddr(),
+			remoteAddr: conn.RemoteAddr(),
+		}
+		select {
+		case <-m.ctx.Done():
+			return
+		case m.recvCh <- packet:
+		}
+	}
 }
 
-// runVLESSMode implements TCP forwarding with round-robin balancing across N TURN sessions.
+func (m *multipathDTLSConn) waitReady(ctx context.Context) bool {
+	if m.activeCount() > 0 {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-m.ctx.Done():
+		return false
+	case <-m.readyCh:
+		return true
+	}
+}
+
+func (m *multipathDTLSConn) activeCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.conns)
+}
+
+func (m *multipathDTLSConn) pickConn() (net.Conn, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(m.conns) == 0 {
+		return nil, fmt.Errorf("no active DTLS connections")
+	}
+	idx := int(m.writeSeq.Add(1)-1) % len(m.conns)
+	return m.conns[idx].conn, nil
+}
+
+func (m *multipathDTLSConn) Read(b []byte) (int, error) {
+	for {
+		var deadline <-chan time.Time
+		if d := m.getReadDeadline(); !d.IsZero() {
+			timer := time.NewTimer(time.Until(d))
+			defer timer.Stop()
+			deadline = timer.C
+		}
+
+		select {
+		case <-m.ctx.Done():
+			return 0, net.ErrClosed
+		case <-deadline:
+			return 0, os.ErrDeadlineExceeded
+		case packet := <-m.recvCh:
+			m.setLastReadAddrs(packet.localAddr, packet.remoteAddr)
+			n := copy(b, packet.payload)
+			return n, nil
+		}
+	}
+}
+
+func (m *multipathDTLSConn) Write(b []byte) (int, error) {
+	conn, err := m.pickConn()
+	if err != nil {
+		return 0, err
+	}
+	if deadline := m.getWriteDeadline(); !deadline.IsZero() {
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return 0, err
+		}
+	}
+	return conn.Write(b)
+}
+
+func (m *multipathDTLSConn) Close() error {
+	m.cancel()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, entry := range m.conns {
+		_ = entry.conn.Close()
+	}
+	m.conns = nil
+	return nil
+}
+
+func (m *multipathDTLSConn) LocalAddr() net.Addr {
+	if addr := m.getLastLocalAddr(); addr != nil {
+		return addr
+	}
+	if conn, err := m.pickConn(); err == nil {
+		return conn.LocalAddr()
+	}
+	return dummyAddr("multipath-local")
+}
+
+func (m *multipathDTLSConn) RemoteAddr() net.Addr {
+	if addr := m.getLastPeerAddr(); addr != nil {
+		return addr
+	}
+	if conn, err := m.pickConn(); err == nil {
+		return conn.RemoteAddr()
+	}
+	return dummyAddr("multipath-remote")
+}
+
+func (m *multipathDTLSConn) SetDeadline(t time.Time) error {
+	m.deadlineMu.Lock()
+	m.readDeadline = t
+	m.writeDeadline = t
+	m.deadlineMu.Unlock()
+	return nil
+}
+
+func (m *multipathDTLSConn) SetReadDeadline(t time.Time) error {
+	m.deadlineMu.Lock()
+	m.readDeadline = t
+	m.deadlineMu.Unlock()
+	return nil
+}
+
+func (m *multipathDTLSConn) SetWriteDeadline(t time.Time) error {
+	m.deadlineMu.Lock()
+	m.writeDeadline = t
+	m.deadlineMu.Unlock()
+	return nil
+}
+
+func (m *multipathDTLSConn) getReadDeadline() time.Time {
+	m.deadlineMu.RLock()
+	defer m.deadlineMu.RUnlock()
+	return m.readDeadline
+}
+
+func (m *multipathDTLSConn) getWriteDeadline() time.Time {
+	m.deadlineMu.RLock()
+	defer m.deadlineMu.RUnlock()
+	return m.writeDeadline
+}
+
+func (m *multipathDTLSConn) setLastReadAddrs(localAddr, peerAddr net.Addr) {
+	m.addrMu.Lock()
+	m.lastLocalAddr = localAddr
+	m.lastPeerAddr = peerAddr
+	m.addrMu.Unlock()
+}
+
+func (m *multipathDTLSConn) getLastLocalAddr() net.Addr {
+	m.addrMu.RLock()
+	defer m.addrMu.RUnlock()
+	return m.lastLocalAddr
+}
+
+func (m *multipathDTLSConn) getLastPeerAddr() net.Addr {
+	m.addrMu.RLock()
+	defer m.addrMu.RUnlock()
+	return m.lastPeerAddr
+}
+
+type smuxHolder struct {
+	mu        sync.RWMutex
+	session   *smux.Session
+	readyCh   chan struct{}
+	readyOnce sync.Once
+}
+
+func newSmuxHolder() *smuxHolder {
+	return &smuxHolder{readyCh: make(chan struct{})}
+}
+
+func (h *smuxHolder) set(s *smux.Session) {
+	h.mu.Lock()
+	h.session = s
+	h.mu.Unlock()
+	h.readyOnce.Do(func() { close(h.readyCh) })
+}
+
+func (h *smuxHolder) clear(s *smux.Session) {
+	h.mu.Lock()
+	if h.session == s {
+		h.session = nil
+	}
+	h.mu.Unlock()
+}
+
+func (h *smuxHolder) get() *smux.Session {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.session
+}
+
+func (h *smuxHolder) waitReady(ctx context.Context) bool {
+	if sess := h.get(); sess != nil && !sess.IsClosed() {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-h.readyCh:
+		return true
+	}
+}
+
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "multipath" }
+func (d dummyAddr) String() string  { return string(d) }
+
+// runVLESSMode implements TCP forwarding over one logical KCP+smux session
+// backed by N TURN/DTLS legs sharing the same session ID.
 func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int, sessionID []byte) {
 	if numSessions <= 0 {
 		numSessions = 1
 	}
-	pool := &sessionPool{}
 
-	var wgMaint sync.WaitGroup
-	for i := 0; i < numSessions; i++ {
-		wgMaint.Add(1)
-		go func(id int) {
-			defer wgMaint.Done()
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
-			}
-			maintainVLESSSession(ctx, tp, peer, id, sessionID, pool)
-		}(i)
-	}
+	holder := newSmuxHolder()
+	go maintainAggregatedVLESSSession(ctx, tp, peer, numSessions, sessionID, holder)
 
-	log.Printf("TCP mode: waiting for sessions to connect (target: %d)", numSessions)
-	for {
-		select {
-		case <-ctx.Done():
-			wgMaint.Wait()
-			return
-		case <-time.After(100 * time.Millisecond):
-		}
-		if pool.count() > 0 {
-			break
-		}
+	log.Printf("TCP mode: waiting for aggregated session to connect (target legs: %d)", numSessions)
+	if !holder.waitReady(ctx) {
+		return
 	}
 
 	listener, err := net.Listen("tcp", listenAddr)
@@ -1095,7 +1339,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 		log.Panicf("TCP listen: %s", err)
 	}
 	context.AfterFunc(ctx, func() { _ = listener.Close() })
-	log.Printf("TCP mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
+	log.Printf("TCP mode: listening on %s (shared smux over %d DTLS legs)", listenAddr, numSessions)
 
 	var wgConn sync.WaitGroup
 	for {
@@ -1104,7 +1348,6 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 			select {
 			case <-ctx.Done():
 				wgConn.Wait()
-				wgMaint.Wait()
 				return
 			default:
 			}
@@ -1112,23 +1355,26 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 			continue
 		}
 
-		sess := pool.pick()
+		sess := holder.get()
 		if sess == nil || sess.IsClosed() {
-			log.Printf("No active sessions, rejecting local TCP connection")
+			log.Printf("No active aggregated smux session, rejecting local TCP connection")
 			_ = tcpConn.Close()
 			continue
 		}
+		log.Printf("TCP client accepted local connection from %s", tcpConn.RemoteAddr())
 
 		wgConn.Add(1)
 		go func(tc net.Conn, s *smux.Session) {
 			defer wgConn.Done()
 			defer func() { _ = tc.Close() }()
 
+			log.Printf("Opening smux stream for local connection %s", tc.RemoteAddr())
 			stream, err := s.OpenStream()
 			if err != nil {
 				log.Printf("smux open stream error: %s", err)
 				return
 			}
+			log.Printf("smux stream opened for local connection %s", tc.RemoteAddr())
 			defer func() { _ = stream.Close() }()
 
 			pipe(ctx, tc, stream)
@@ -1136,7 +1382,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 	}
 }
 
-func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, sessionID []byte, pool *sessionPool) {
+func maintainAggregatedVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, numSessions int, sessionID []byte, holder *smuxHolder) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1144,9 +1390,52 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		default:
 		}
 
-		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer, sessionID, byte(id))
+		sessionCtx, cancel := context.WithCancel(ctx)
+		bundle := newMultipathDTLSConn(sessionCtx)
+
+		var wg sync.WaitGroup
+		for i := 0; i < numSessions; i++ {
+			wg.Add(1)
+			go func(id byte) {
+				defer wg.Done()
+				select {
+				case <-sessionCtx.Done():
+					return
+				case <-time.After(time.Duration(id) * 300 * time.Millisecond):
+				}
+				maintainDTLSStream(sessionCtx, tp, peer, id, sessionID, bundle)
+			}(byte(i))
+		}
+
+		if !bundle.waitReady(sessionCtx) {
+			cancel()
+			_ = bundle.Close()
+			wg.Wait()
+			return
+		}
+
+		kcpSess, err := tcputil.NewKCPOverDTLS(bundle, false)
 		if err != nil {
-			log.Printf("[session %d] setup error: %s, retrying...", id, err)
+			log.Printf("aggregated KCP setup error: %s, retrying...", err)
+			cancel()
+			_ = bundle.Close()
+			wg.Wait()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+		log.Printf("Aggregated KCP session established")
+
+		smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
+		if err != nil {
+			log.Printf("aggregated smux setup error: %s, retrying...", err)
+			_ = kcpSess.Close()
+			cancel()
+			_ = bundle.Close()
+			wg.Wait()
 			select {
 			case <-ctx.Done():
 				return
@@ -1155,22 +1444,31 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 			continue
 		}
 
-		pool.add(smuxSess)
-		log.Printf("[session %d] connected (active: %d)", id, pool.count())
+		holder.set(smuxSess)
+		log.Printf("Aggregated smux session established")
+		log.Printf("Aggregated VLESS session established over %d DTLS legs", numSessions)
 
 		for !smuxSess.IsClosed() {
 			select {
 			case <-ctx.Done():
-				pool.remove(smuxSess)
-				cleanup()
+				holder.clear(smuxSess)
+				_ = smuxSess.Close()
+				_ = kcpSess.Close()
+				cancel()
+				_ = bundle.Close()
+				wg.Wait()
 				return
 			case <-time.After(1 * time.Second):
 			}
 		}
 
-		pool.remove(smuxSess)
-		cleanup()
-		log.Printf("[session %d] disconnected (active: %d), reconnecting...", id, pool.count())
+		holder.clear(smuxSess)
+		_ = smuxSess.Close()
+		_ = kcpSess.Close()
+		cancel()
+		_ = bundle.Close()
+		wg.Wait()
+		log.Printf("Aggregated VLESS session disconnected, reconnecting...")
 
 		select {
 		case <-ctx.Done():
@@ -1180,7 +1478,46 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 	}
 }
 
-func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, sessionID []byte, streamID byte) (*smux.Session, func(), error) {
+func maintainDTLSStream(ctx context.Context, tp *turnParams, peer *net.UDPAddr, streamID byte, sessionID []byte, bundle *multipathDTLSConn) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		dtlsConn, cleanup, err := createDTLSStream(ctx, tp, peer, sessionID, streamID)
+		if err != nil {
+			log.Printf("[stream %d] setup error: %s, retrying...", streamID, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+
+		done := bundle.AddConn(streamID, dtlsConn)
+		log.Printf("[stream %d] connected (active legs: %d)", streamID, bundle.activeCount())
+
+		select {
+		case <-ctx.Done():
+			cleanup()
+			return
+		case <-done:
+			cleanup()
+		}
+
+		log.Printf("[stream %d] disconnected (active legs: %d), reconnecting...", streamID, bundle.activeCount())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func createDTLSStream(ctx context.Context, tp *turnParams, peer *net.UDPAddr, sessionID []byte, streamID byte) (net.Conn, func(), error) {
 	var cleanupFns []func()
 	cleanup := func() {
 		for i := len(cleanupFns) - 1; i >= 0; i-- {
@@ -1289,24 +1626,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, s
 			return nil, nil, fmt.Errorf("write session header: %w", err)
 		}
 	}
-
-	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("KCP session: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { _ = kcpSess.Close() })
-	log.Printf("KCP session established")
-
-	smuxSess, err := smux.Client(kcpSess, tcputil.DefaultSmuxConfig())
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("smux client: %w", err)
-	}
-	cleanupFns = append(cleanupFns, func() { _ = smuxSess.Close() })
-	log.Printf("smux session established")
-
-	return smuxSess, cleanup, nil
+	return dtlsConn, cleanup, nil
 }
 
 // relayPacketConn wraps a TURN relay PacketConn to direct all writes to the peer.

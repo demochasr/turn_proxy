@@ -39,6 +39,9 @@ type sessionDatagramConn struct {
 	deadlineMu    sync.RWMutex
 	readDeadline  time.Time
 	writeDeadline time.Time
+	addrMu        sync.RWMutex
+	lastLocalAddr net.Addr
+	lastPeerAddr  net.Addr
 }
 
 type UserSession struct {
@@ -52,9 +55,15 @@ type UserSession struct {
 	Ctx         context.Context
 	Cancel      context.CancelFunc
 	Manager     *SessionManager
-	RecvCh      chan []byte
+	RecvCh      chan receivedPacket
 	WriteSeq    atomic.Uint64
 	CleanupOnce sync.Once
+}
+
+type receivedPacket struct {
+	payload    []byte
+	localAddr  net.Addr
+	remoteAddr net.Addr
 }
 
 type SessionManager struct {
@@ -82,7 +91,7 @@ func (m *SessionManager) GetOrCreate(ctx context.Context, id, connectAddr, mode 
 		Ctx:         sessionCtx,
 		Cancel:      cancel,
 		Manager:     m,
-		RecvCh:      make(chan []byte, 1024),
+		RecvCh:      make(chan receivedPacket, 1024),
 	}
 
 	switch mode {
@@ -280,7 +289,11 @@ func (s *UserSession) connReadLoop(id byte, conn net.Conn, done chan struct{}) {
 			return
 		}
 
-		packet := append([]byte(nil), buf[:n]...)
+		packet := receivedPacket{
+			payload:    append([]byte(nil), buf[:n]...),
+			localAddr:  conn.LocalAddr(),
+			remoteAddr: conn.RemoteAddr(),
+		}
 		select {
 		case <-s.Ctx.Done():
 			return
@@ -316,7 +329,8 @@ func (c *sessionDatagramConn) Read(b []byte) (int, error) {
 		case <-deadline:
 			return 0, os.ErrDeadlineExceeded
 		case packet := <-c.session.RecvCh:
-			n := copy(b, packet)
+			c.setLastReadAddrs(packet.localAddr, packet.remoteAddr)
+			n := copy(b, packet.payload)
 			return n, nil
 		}
 	}
@@ -350,6 +364,9 @@ func (c *sessionDatagramConn) closeOnly() error {
 }
 
 func (c *sessionDatagramConn) LocalAddr() net.Addr {
+	if addr := c.getLastLocalAddr(); addr != nil {
+		return addr
+	}
 	if conn, err := c.session.pickConn(); err == nil {
 		return conn.LocalAddr()
 	}
@@ -357,6 +374,9 @@ func (c *sessionDatagramConn) LocalAddr() net.Addr {
 }
 
 func (c *sessionDatagramConn) RemoteAddr() net.Addr {
+	if addr := c.getLastPeerAddr(); addr != nil {
+		return addr
+	}
 	if conn, err := c.session.pickConn(); err == nil {
 		return conn.RemoteAddr()
 	}
@@ -395,6 +415,25 @@ func (c *sessionDatagramConn) getWriteDeadline() time.Time {
 	c.deadlineMu.RLock()
 	defer c.deadlineMu.RUnlock()
 	return c.writeDeadline
+}
+
+func (c *sessionDatagramConn) setLastReadAddrs(localAddr, peerAddr net.Addr) {
+	c.addrMu.Lock()
+	c.lastLocalAddr = localAddr
+	c.lastPeerAddr = peerAddr
+	c.addrMu.Unlock()
+}
+
+func (c *sessionDatagramConn) getLastLocalAddr() net.Addr {
+	c.addrMu.RLock()
+	defer c.addrMu.RUnlock()
+	return c.lastLocalAddr
+}
+
+func (c *sessionDatagramConn) getLastPeerAddr() net.Addr {
+	c.addrMu.RLock()
+	defer c.addrMu.RUnlock()
+	return c.lastPeerAddr
 }
 
 type dummyAddr string
