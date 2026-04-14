@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,16 +31,30 @@ const (
 type streamEntry struct {
 	id   byte
 	conn net.Conn
+	done chan struct{}
+}
+
+type sessionDatagramConn struct {
+	session       *UserSession
+	deadlineMu    sync.RWMutex
+	readDeadline  time.Time
+	writeDeadline time.Time
 }
 
 type UserSession struct {
 	ID          string
+	Mode        string
+	ConnectAddr string
 	Conns       []streamEntry
 	BackendConn net.Conn
+	PacketConn  *sessionDatagramConn
 	Lock        sync.RWMutex
 	Ctx         context.Context
 	Cancel      context.CancelFunc
 	Manager     *SessionManager
+	RecvCh      chan []byte
+	WriteSeq    atomic.Uint64
+	CleanupOnce sync.Once
 }
 
 type SessionManager struct {
@@ -46,36 +62,117 @@ type SessionManager struct {
 	Lock     sync.RWMutex
 }
 
-func (s *SessionManager) GetOrCreate(ctx context.Context, id string, connectAddr string) (*UserSession, error) {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
+func (m *SessionManager) GetOrCreate(ctx context.Context, id, connectAddr, mode string) (*UserSession, error) {
+	m.Lock.Lock()
+	defer m.Lock.Unlock()
 
-	if session, ok := s.Sessions[id]; ok {
+	if session, ok := m.Sessions[id]; ok {
+		if session.Mode != mode {
+			return nil, fmt.Errorf("session %s mode mismatch: have=%s want=%s", id, session.Mode, mode)
+		}
 		return session, nil
-	}
-
-	backendConn, err := net.Dial("udp", connectAddr)
-	if err != nil {
-		return nil, err
 	}
 
 	sessionCtx, cancel := context.WithCancel(ctx)
 	session := &UserSession{
 		ID:          id,
+		Mode:        mode,
+		ConnectAddr: connectAddr,
 		Conns:       make([]streamEntry, 0),
-		BackendConn: backendConn,
-		Manager:     s,
 		Ctx:         sessionCtx,
 		Cancel:      cancel,
+		Manager:     m,
+		RecvCh:      make(chan []byte, 1024),
 	}
-	s.Sessions[id] = session
-	go session.backendReaderLoop()
 
+	switch mode {
+	case modeUDPWireGuard:
+		backendConn, err := net.Dial("udp", connectAddr)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		session.BackendConn = backendConn
+		go session.backendReaderLoop()
+	case modeTCPVLESS:
+		session.PacketConn = &sessionDatagramConn{session: session}
+		go session.tcpBackendLoop()
+	default:
+		cancel()
+		return nil, fmt.Errorf("unsupported session mode: %s", mode)
+	}
+
+	m.Sessions[id] = session
 	return session, nil
+}
+
+func (s *UserSession) AddConn(id byte, conn net.Conn) <-chan struct{} {
+	done := make(chan struct{})
+
+	s.Lock.Lock()
+	for i, entry := range s.Conns {
+		if entry.id == id {
+			_ = entry.conn.Close()
+			s.Conns[i] = streamEntry{id: id, conn: conn, done: done}
+			s.Lock.Unlock()
+			if s.Mode == modeTCPVLESS {
+				go s.connReadLoop(id, conn, done)
+			}
+			return done
+		}
+	}
+	s.Conns = append(s.Conns, streamEntry{id: id, conn: conn, done: done})
+	s.Lock.Unlock()
+
+	if s.Mode == modeTCPVLESS {
+		go s.connReadLoop(id, conn, done)
+	}
+	return done
+}
+
+func (s *UserSession) RemoveConn(id byte, conn net.Conn) {
+	s.Lock.Lock()
+	for i, entry := range s.Conns {
+		if entry.id == id && entry.conn == conn {
+			s.Conns = append(s.Conns[:i], s.Conns[i+1:]...)
+			break
+		}
+	}
+	noConns := len(s.Conns) == 0
+	s.Lock.Unlock()
+
+	if noConns {
+		s.Cleanup()
+	}
+}
+
+func (s *UserSession) Cleanup() {
+	s.CleanupOnce.Do(func() {
+		s.Cancel()
+
+		if s.BackendConn != nil {
+			_ = s.BackendConn.Close()
+		}
+		if s.PacketConn != nil {
+			_ = s.PacketConn.closeOnly()
+		}
+
+		s.Manager.Lock.Lock()
+		delete(s.Manager.Sessions, s.ID)
+		s.Manager.Lock.Unlock()
+
+		s.Lock.Lock()
+		for _, entry := range s.Conns {
+			_ = entry.conn.Close()
+		}
+		s.Conns = nil
+		s.Lock.Unlock()
+	})
 }
 
 func (s *UserSession) backendReaderLoop() {
 	defer s.Cleanup()
+
 	buf := make([]byte, 1600)
 	var lastUsed uint32
 	for {
@@ -108,56 +205,202 @@ func (s *UserSession) backendReaderLoop() {
 
 		if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 			log.Printf("Session %s write deadline error: %v", s.ID, err)
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		if _, err := conn.Write(buf[:n]); err != nil {
 			log.Printf("Session %s DTLS write error: %v", s.ID, err)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}
 }
 
-func (s *UserSession) AddConn(id byte, conn net.Conn) {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
+func (s *UserSession) tcpBackendLoop() {
+	defer s.Cleanup()
 
-	for i, entry := range s.Conns {
-		if entry.id == id {
-			entry.conn.Close()
-			s.Conns[i].conn = conn
-			return
-		}
+	kcpSess, err := tcputil.NewKCPOverDTLS(s.PacketConn, true)
+	if err != nil {
+		log.Printf("Session %s KCP session error: %s", s.ID, err)
+		return
 	}
-	s.Conns = append(s.Conns, streamEntry{id: id, conn: conn})
-}
+	defer kcpSess.Close()
+	log.Printf("Session %s KCP session established (server)", s.ID)
 
-func (s *UserSession) RemoveConn(id byte, conn net.Conn) {
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-	for i, entry := range s.Conns {
-		if entry.id == id && entry.conn == conn {
-			s.Conns = append(s.Conns[:i], s.Conns[i+1:]...)
+	smuxSess, err := smux.Server(kcpSess, tcputil.DefaultSmuxConfig())
+	if err != nil {
+		log.Printf("Session %s smux server error: %s", s.ID, err)
+		return
+	}
+	defer smuxSess.Close()
+	log.Printf("Session %s smux session established (server)", s.ID)
+
+	var wg sync.WaitGroup
+	for {
+		stream, err := smuxSess.AcceptStream()
+		if err != nil {
+			select {
+			case <-s.Ctx.Done():
+			default:
+				log.Printf("Session %s smux accept error: %s", s.ID, err)
+			}
 			break
 		}
+
+		wg.Add(1)
+		go func(st *smux.Stream) {
+			defer wg.Done()
+			defer st.Close()
+
+			backendConn, err := net.DialTimeout("tcp", s.ConnectAddr, 10*time.Second)
+			if err != nil {
+				log.Printf("Session %s backend dial error: %s", s.ID, err)
+				return
+			}
+			defer backendConn.Close()
+
+			pipeConn(s.Ctx, st, backendConn)
+		}(stream)
+	}
+	wg.Wait()
+}
+
+func (s *UserSession) connReadLoop(id byte, conn net.Conn, done chan struct{}) {
+	defer close(done)
+	defer s.RemoveConn(id, conn)
+
+	buf := make([]byte, 2048)
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			log.Printf("Session %s stream %d read deadline error: %v", s.ID, id, err)
+			return
+		}
+		n, err := conn.Read(buf)
+		if err != nil {
+			log.Printf("Session %s stream %d closed: %v", s.ID, id, err)
+			return
+		}
+
+		packet := append([]byte(nil), buf[:n]...)
+		select {
+		case <-s.Ctx.Done():
+			return
+		case s.RecvCh <- packet:
+		}
 	}
 }
 
-func (s *UserSession) Cleanup() {
-	s.Cancel()
-	s.BackendConn.Close()
+func (s *UserSession) pickConn() (net.Conn, error) {
+	s.Lock.RLock()
+	defer s.Lock.RUnlock()
 
-	s.Manager.Lock.Lock()
-	delete(s.Manager.Sessions, s.ID)
-	s.Manager.Lock.Unlock()
-
-	s.Lock.Lock()
-	for _, entry := range s.Conns {
-		entry.conn.Close()
+	if len(s.Conns) == 0 {
+		return nil, errors.New("no active DTLS connections")
 	}
-	s.Conns = nil
-	s.Lock.Unlock()
+
+	idx := int(s.WriteSeq.Add(1)-1) % len(s.Conns)
+	return s.Conns[idx].conn, nil
 }
+
+func (c *sessionDatagramConn) Read(b []byte) (int, error) {
+	for {
+		var deadline <-chan time.Time
+		if d := c.getReadDeadline(); !d.IsZero() {
+			timer := time.NewTimer(time.Until(d))
+			defer timer.Stop()
+			deadline = timer.C
+		}
+
+		select {
+		case <-c.session.Ctx.Done():
+			return 0, net.ErrClosed
+		case <-deadline:
+			return 0, os.ErrDeadlineExceeded
+		case packet := <-c.session.RecvCh:
+			n := copy(b, packet)
+			return n, nil
+		}
+	}
+}
+
+func (c *sessionDatagramConn) Write(b []byte) (int, error) {
+	conn, err := c.session.pickConn()
+	if err != nil {
+		return 0, err
+	}
+
+	if deadline := c.getWriteDeadline(); !deadline.IsZero() {
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return 0, err
+		}
+	}
+	return conn.Write(b)
+}
+
+func (c *sessionDatagramConn) Close() error {
+	c.session.Cleanup()
+	return nil
+}
+
+func (c *sessionDatagramConn) closeOnly() error {
+	c.deadlineMu.Lock()
+	c.readDeadline = time.Time{}
+	c.writeDeadline = time.Time{}
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+func (c *sessionDatagramConn) LocalAddr() net.Addr {
+	if conn, err := c.session.pickConn(); err == nil {
+		return conn.LocalAddr()
+	}
+	return dummyAddr("session-local")
+}
+
+func (c *sessionDatagramConn) RemoteAddr() net.Addr {
+	if conn, err := c.session.pickConn(); err == nil {
+		return conn.RemoteAddr()
+	}
+	return dummyAddr("session-remote")
+}
+
+func (c *sessionDatagramConn) SetDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+func (c *sessionDatagramConn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+func (c *sessionDatagramConn) SetWriteDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
+	return nil
+}
+
+func (c *sessionDatagramConn) getReadDeadline() time.Time {
+	c.deadlineMu.RLock()
+	defer c.deadlineMu.RUnlock()
+	return c.readDeadline
+}
+
+func (c *sessionDatagramConn) getWriteDeadline() time.Time {
+	c.deadlineMu.RLock()
+	defer c.deadlineMu.RUnlock()
+	return c.writeDeadline
+}
+
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "session" }
+func (d dummyAddr) String() string  { return string(d) }
 
 func readBootstrapToken(conn net.Conn, secret, publicKey, proxyID, mode string) error {
 	if secret == "" && publicKey == "" {
@@ -182,24 +425,28 @@ func readBootstrapToken(conn net.Conn, secret, publicKey, proxyID, mode string) 
 	return nil
 }
 
-func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string, manager *SessionManager) {
+func readSessionHeader(conn net.Conn) (string, byte, error) {
 	idBuf := make([]byte, 17)
 	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		log.Printf("Failed to set session header deadline: %v", err)
-		return
+		return "", 0, err
 	}
 	if _, err := io.ReadFull(conn, idBuf); err != nil {
+		return "", 0, err
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return "", 0, err
+	}
+	return fmt.Sprintf("%x", idBuf[:16]), idBuf[16], nil
+}
+
+func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string, manager *SessionManager) {
+	sessionID, streamID, err := readSessionHeader(conn)
+	if err != nil {
 		log.Printf("Failed to read session header: %v", err)
 		return
 	}
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear session header deadline: %v", err)
-		return
-	}
 
-	sessionID := fmt.Sprintf("%x", idBuf[:16])
-	streamID := idBuf[16]
-	session, err := manager.GetOrCreate(ctx, sessionID, connectAddr)
+	session, err := manager.GetOrCreate(ctx, sessionID, connectAddr, modeUDPWireGuard)
 	if err != nil {
 		log.Printf("Failed to get/create session: %v", err)
 		return
@@ -231,59 +478,36 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string,
 	}
 }
 
-func handleTCPConnection(ctx context.Context, dtlsConn net.Conn, connectAddr string) {
-	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, true)
+func handleTCPConnection(ctx context.Context, conn net.Conn, connectAddr string, manager *SessionManager) {
+	sessionID, streamID, err := readSessionHeader(conn)
 	if err != nil {
-		log.Printf("KCP session error: %s", err)
+		log.Printf("Failed to read TCP session header: %v", err)
 		return
 	}
-	defer kcpSess.Close()
-	log.Printf("KCP session established (server)")
 
-	smuxSess, err := smux.Server(kcpSess, tcputil.DefaultSmuxConfig())
+	session, err := manager.GetOrCreate(ctx, sessionID, connectAddr, modeTCPVLESS)
 	if err != nil {
-		log.Printf("smux server error: %s", err)
+		log.Printf("Failed to get/create TCP session: %v", err)
 		return
 	}
-	defer smuxSess.Close()
-	log.Printf("smux session established (server)")
 
-	var wg sync.WaitGroup
-	for {
-		stream, err := smuxSess.AcceptStream()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				log.Printf("smux accept error: %s", err)
-			}
-			break
-		}
+	done := session.AddConn(streamID, conn)
+	log.Printf("New TCP stream %d for session %s from %s", streamID, sessionID, conn.RemoteAddr())
 
-		wg.Add(1)
-		go func(s *smux.Stream) {
-			defer wg.Done()
-			defer s.Close()
-
-			backendConn, err := net.DialTimeout("tcp", connectAddr, 10*time.Second)
-			if err != nil {
-				log.Printf("backend dial error: %s", err)
-				return
-			}
-			defer backendConn.Close()
-
-			pipeConn(ctx, s, backendConn)
-		}(stream)
+	select {
+	case <-ctx.Done():
+	case <-session.Ctx.Done():
+	case <-done:
 	}
-	wg.Wait()
 }
 
 func pipeConn(ctx context.Context, c1, c2 net.Conn) {
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
+
 	context.AfterFunc(ctx2, func() {
-		c1.SetDeadline(time.Now())
-		c2.SetDeadline(time.Now())
+		_ = c1.SetDeadline(time.Now())
+		_ = c2.SetDeadline(time.Now())
 	})
 
 	var wg sync.WaitGroup
@@ -291,16 +515,16 @@ func pipeConn(ctx context.Context, c1, c2 net.Conn) {
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		io.Copy(c1, c2)
+		_, _ = io.Copy(c1, c2)
 	}()
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		io.Copy(c2, c1)
+		_, _ = io.Copy(c2, c1)
 	}()
 	wg.Wait()
-	c1.SetDeadline(time.Time{})
-	c2.SetDeadline(time.Time{})
+	_ = c1.SetDeadline(time.Time{})
+	_ = c2.SetDeadline(time.Time{})
 }
 
 func main() {
@@ -314,6 +538,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
@@ -328,7 +553,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	if len(*connect) == 0 {
+	if *connect == "" {
 		log.Panicf("server address is required")
 	}
 
@@ -412,7 +637,7 @@ func main() {
 			}
 
 			if *tcpMode {
-				handleTCPConnection(ctx, dtlsConn, *connect)
+				handleTCPConnection(ctx, dtlsConn, *connect, manager)
 			} else {
 				handleUDPConnection(ctx, dtlsConn, *connect, manager)
 			}

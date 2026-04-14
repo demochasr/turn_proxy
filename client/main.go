@@ -941,11 +941,6 @@ func main() { //nolint:cyclop
 		getCreds:       getCreds,
 	}
 
-	if *tcpMode {
-		runVLESSMode(ctx, params, peer, *listen, *n)
-		return
-	}
-
 	var sessionID []byte
 	if *sessionIDFlag != "" {
 		sessionID = make([]byte, 16)
@@ -956,6 +951,11 @@ func main() { //nolint:cyclop
 		sessionID, _ = uuid.New().MarshalBinary()
 	}
 	log.Printf("Session ID: %x", sessionID)
+
+	if *tcpMode {
+		runVLESSMode(ctx, params, peer, *listen, *n, sessionID)
+		return
+	}
 
 	listenConnChan := make(chan net.PacketConn)
 	listenConn, err := net.ListenPacket("udp", *listen) // nolint: noctx
@@ -1057,7 +1057,7 @@ func (p *sessionPool) count() int {
 }
 
 // runVLESSMode implements TCP forwarding with round-robin balancing across N TURN sessions.
-func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
+func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int, sessionID []byte) {
 	if numSessions <= 0 {
 		numSessions = 1
 	}
@@ -1073,7 +1073,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 				return
 			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
 			}
-			maintainVLESSSession(ctx, tp, peer, id, pool)
+			maintainVLESSSession(ctx, tp, peer, id, sessionID, pool)
 		}(i)
 	}
 
@@ -1136,7 +1136,7 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 	}
 }
 
-func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool) {
+func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, sessionID []byte, pool *sessionPool) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1144,7 +1144,7 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 		default:
 		}
 
-		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer)
+		smuxSess, cleanup, err := createSmuxSession(ctx, tp, peer, sessionID, byte(id))
 		if err != nil {
 			log.Printf("[session %d] setup error: %s, retrying...", id, err)
 			select {
@@ -1180,7 +1180,7 @@ func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr
 	}
 }
 
-func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr) (*smux.Session, func(), error) {
+func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, sessionID []byte, streamID byte) (*smux.Session, func(), error) {
 	var cleanupFns []func()
 	cleanup := func() {
 		for i := len(cleanupFns) - 1; i >= 0; i-- {
@@ -1280,6 +1280,13 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr) (
 		if err = bootstrap.Write(dtlsConn, tp.bootstrapToken); err != nil {
 			cleanup()
 			return nil, nil, fmt.Errorf("write bootstrap token: %w", err)
+		}
+	}
+	if len(sessionID) == 16 {
+		header := append(append([]byte{}, sessionID...), streamID)
+		if _, err = dtlsConn.Write(header); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("write session header: %w", err)
 		}
 	}
 
